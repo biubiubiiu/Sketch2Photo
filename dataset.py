@@ -23,7 +23,8 @@ def get_default_transform(resolution):
             transforms.ToTensor(),
         ]
     )
-    prompt_transform = lambda classname: f"a photo of {classname}"
+    # prompt_transform = lambda classname: f"a photo of {classname}"
+    prompt_transform = lambda classname: "a high-quality, detailed, and professional image"
     return photo_transform, sketch_transform, prompt_transform
 
 

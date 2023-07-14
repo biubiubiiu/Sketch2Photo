@@ -1,24 +1,20 @@
 import itertools
 import math
 import os
-import random
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision.transforms.functional as T
-from diffusers import (AutoencoderKL, ControlNetModel, DDPMScheduler,
-                       StableDiffusionControlNetPipeline, UNet2DConditionModel,
-                       UniPCMultistepScheduler)
+from diffusers import StableDiffusionControlNetPipeline, UniPCMultistepScheduler
 from diffusers.optimization import get_scheduler
 from PIL import Image
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
 
 from dataset import get_train_dataset, get_val_dataset
+from model import Model
 from utils import parse_args, setup_environment
 
 
@@ -94,46 +90,6 @@ def save_visual_results(image_logs, save_root):
         dst.save(save_root.joinpath(f"{idx}.png"))
 
 
-def import_model_class_from_model_name_or_path(pretrained_model_name: str, revision: str):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name,
-        subfolder="text_encoder",
-        revision=revision,
-    )
-    model_class = text_encoder_config.architectures[0]
-
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
-
-        return CLIPTextModel
-    elif model_class == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import \
-            RobertaSeriesModelWithTransformation
-
-        return RobertaSeriesModelWithTransformation
-    else:
-        raise ValueError(f"{model_class} is not supported.")
-
-
-def tokenize_prompts(tokenizer, prompts):
-    prompts_to_tokenize = []
-    for prompt in prompts:
-        if random.random() < args.proportion_empty_prompts:
-            prompts_to_tokenize.append("")
-        elif isinstance(prompt, str):
-            prompts_to_tokenize.append(prompt)
-        else:
-            raise ValueError(f"Prompts `{prompts}` should contain either strings or lists of strings.")
-    inputs = tokenizer(
-        prompts_to_tokenize,
-        max_length=tokenizer.model_max_length,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )
-    return inputs.input_ids
-
-
 def main(args):
     logger, accelerator = setup_environment(args)
     logger.info(accelerator.state, main_process_only=False)
@@ -145,18 +101,33 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+
+    model = Model(
+        pretrained_model_name=args.pretrained_model_name,
+        revision=args.revision,
+        weight_dtype=weight_dtype,
+    )
+    model = model.to(accelerator.device)
+
     # evaluation
     if args.phase == "eval":
         assert args.controlnet_weight != None
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_weight)
+        model.load_controlnet_weight(args.controlnet_weight)
 
         image_logs = run_validation(
             val_dataloader,
-            controlnet,
+            model.controlnet,
             pretrained_model_name=args.pretrained_model_name,
             seed=args.seed,
             num_validation_images=args.num_validation_images,
+            num_samples=args.num_validation_samples,
+            weight_dtype=weight_dtype,
         )
         save_root = Path(args.output_dir).joinpath("visuals")
         save_root.mkdir(parents=True, exist_ok=True)
@@ -164,35 +135,12 @@ def main(args):
         sys.exit(0)
 
     # training
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name,
-        subfolder="tokenizer",
-        revision=args.revision,
-        use_fast=False,
-    )
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name, subfolder="scheduler")
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name, args.revision)
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name,
-        subfolder="text_encoder",
-        revision=args.revision,
-    )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name, subfolder="vae", revision=args.revision)
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name, subfolder="unet", revision=args.revision
-    )
+    model.train()
 
-    logger.info("Initializing controlnet weights from unet")
-    controlnet = ControlNetModel.from_unet(unet)
-
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    controlnet.train()
-
-    # Optimizer creation
+    # NOTE: pytorch optimizer explicitly accepts parameter that requires grad
+    # see https://github.com/pytorch/pytorch/issues/679
     optimizer = torch.optim.AdamW(
-        controlnet.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -223,20 +171,9 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
-
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-
-    # Move vae, unet and text_encoder to device and cast to weight_dtype
-    vae.to(accelerator.device, dtype=weight_dtype)
-    unet.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -296,63 +233,18 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         for batch in train_dataloader:
-            with accelerator.accumulate(controlnet):
+            with accelerator.accumulate(model):
 
                 # TODO: prompts can be preprocessed, or cached on the fly
-                photos, sketches, tokenized_prompts = (
+                photos, sketches, prompts = (
                     batch["photos"].to(device=accelerator.device, dtype=weight_dtype),
                     batch["sketches"].to(device=accelerator.device, dtype=weight_dtype),
-                    tokenize_prompts(tokenizer, batch["prompts"]).to(device=accelerator.device),
+                    batch["prompts"],
                 )
-                # Convert images to latent space
-                latents = vae.encode(photos).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=latents.device,
-                    dtype=torch.long,
-                )
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(tokenized_prompts)[0]
-
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    controlnet_cond=sketches,
-                    return_dict=False,
-                )
-
-                # Predict the noise residual
-                model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                ).sample
-
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                loss = model(photos, sketches, prompts)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
+                    params_to_clip = model.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -365,22 +257,21 @@ def main(args):
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        unwrapped_model.controlnet.save_pretrained(args.output_dir)
 
                     if global_step % args.validation_steps == 0:
                         logger.info("Running validation... ")
-                        image_logs = run_validation(
-                            val_dataloader,
-                            controlnet=accelerator.unwrap_model(controlnet),
-                            pretrained_model_name=args.pretrained_model_name,
-                            seed=args.seed,
-                            num_validation_images=args.num_validation_images,
-                            num_samples=4,
-                            weight_dtype=weight_dtype,
-                        )
-                        log_eval_result_to_tracker(image_logs, accelerator, global_step)
+                        # image_logs = run_validation(
+                        #     val_dataloader,
+                        #     controlnet=accelerator.unwrap_model(model).controlnet,
+                        #     pretrained_model_name=args.pretrained_model_name,
+                        #     seed=args.seed,
+                        #     num_validation_images=args.num_validation_images,
+                        #     num_samples=args.num_validation_samples,
+                        #     weight_dtype=weight_dtype,
+                        # )
+                        # log_eval_result_to_tracker(image_logs, accelerator, global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -392,8 +283,8 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet = accelerator.unwrap_model(controlnet)
-        controlnet.save_pretrained(args.output_dir)
+        model = accelerator.unwrap_model(model)
+        model.controlnet.save_pretrained(args.output_dir)
 
     accelerator.end_training()
 

@@ -27,7 +27,7 @@ def parse_args():
         help="The directory that stores the model predictions and checkpoints.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument("--resolution", type=int, default=512, help="The resolution for input images")
+    parser.add_argument("--resolution", type=int, default=256, help="The resolution for input images")
     parser.add_argument("--train_batch_size", type=int, default=1, help="Training batch size (per device)")
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1500,
         help="Save a checkpoint of the training state every X updates",
     )
     parser.add_argument(
