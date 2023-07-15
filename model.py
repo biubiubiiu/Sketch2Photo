@@ -78,6 +78,7 @@ class Model(nn.Module):
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
+        self.controlnet.requires_grad_(True)
 
         self.prmopt = prompt
         self.proportion_empty_prompts = proportion_empty_prompts

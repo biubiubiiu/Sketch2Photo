@@ -22,6 +22,7 @@ def run_validation(
     val_dataloader,
     controlnet,
     pretrained_model_name,
+    prompt,
     num_validation_images=1,
     num_samples=None,
     seed=None,
@@ -42,9 +43,8 @@ def run_validation(
 
     image_logs = []
     num_eval_samples = num_samples or len(val_dataloader)
-    pbar = tqdm(total=num_eval_samples)
-    for batch in itertools.islice(val_dataloader, num_eval_samples):
-        sketch, prompt = (batch["sketches"], batch["prompts"][0])
+    for batch in tqdm(itertools.islice(val_dataloader, num_eval_samples), total=num_eval_samples):
+        sketch = batch["sketches"]
 
         images = []
         for _ in range(num_validation_images):
@@ -59,9 +59,6 @@ def run_validation(
                 "prompt": prompt,
             }
         )
-
-        pbar.update()
-
     return image_logs
 
 
@@ -101,8 +98,6 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -124,6 +119,7 @@ def main(args):
             val_dataloader,
             model.controlnet,
             pretrained_model_name=args.pretrained_model_name,
+            prompt=args.validation_prompt,
             seed=args.seed,
             num_validation_images=args.num_validation_images,
             num_samples=args.num_validation_samples,
@@ -154,18 +150,14 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_training_steps=max_train_steps * args.gradient_accumulation_steps,
         num_cycles=args.lr_num_cycles,
         power=args.lr_power,
     )
@@ -177,10 +169,9 @@ def main(args):
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
     # Train
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -191,7 +182,6 @@ def main(args):
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     global_step = 0
     first_epoch = 0
@@ -224,7 +214,7 @@ def main(args):
         initial_global_step = 0
 
     progress_bar = tqdm(
-        range(0, args.max_train_steps),
+        range(0, max_train_steps),
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -239,7 +229,7 @@ def main(args):
                 photos, sketches, prompts = (
                     batch["photos"].to(device=accelerator.device, dtype=weight_dtype),
                     batch["sketches"].to(device=accelerator.device, dtype=weight_dtype),
-                    batch["prompts"],
+                    batch["captions"],
                 )
                 loss = model(photos, sketches, prompts)
                 accelerator.backward(loss)
@@ -266,6 +256,7 @@ def main(args):
                         #     val_dataloader,
                         #     controlnet=accelerator.unwrap_model(model).controlnet,
                         #     pretrained_model_name=args.pretrained_model_name,
+                        #     prompt=args.validation_prompt,
                         #     seed=args.seed,
                         #     num_validation_images=args.num_validation_images,
                         #     num_samples=args.num_validation_samples,
@@ -277,7 +268,7 @@ def main(args):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= max_train_steps:
                 break
 
     # Create the pipeline using using the trained modules and save it.

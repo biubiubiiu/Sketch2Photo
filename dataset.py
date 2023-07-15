@@ -23,9 +23,8 @@ def get_default_transform(resolution):
             transforms.ToTensor(),
         ]
     )
-    # prompt_transform = lambda classname: f"a photo of {classname}"
-    prompt_transform = lambda classname: "a high-quality, detailed, and professional image"
-    return photo_transform, sketch_transform, prompt_transform
+    caption_transform = lambda classname: f"a photo of {classname}"
+    return photo_transform, sketch_transform, caption_transform
 
 
 def get_train_dataset(data_root, resolution):
@@ -37,13 +36,13 @@ def get_val_dataset(data_root, resolution):
 
 
 def get_dataset(data_root, data_split, resolution):
-    photo_transform, sketch_transform, prompt_transform = get_default_transform(resolution)
+    photo_transform, sketch_transform, caption_transform = get_default_transform(resolution)
     dataset = SketchyDataset(
         data_root,
         split=data_split,
         photo_transform=photo_transform,
         sketch_transform=sketch_transform,
-        prompt_transform=prompt_transform,
+        caption_transform=caption_transform,
     )
     return dataset
 
@@ -55,7 +54,7 @@ class SketchyDataset(data.Dataset):
         split="train",
         photo_transform=transforms.ToTensor(),
         sketch_transform=transforms.ToTensor(),
-        prompt_transform=lambda x: x,
+        caption_transform=lambda x: x,
     ):
         super(SketchyDataset, self).__init__()
 
@@ -77,7 +76,7 @@ class SketchyDataset(data.Dataset):
 
         self.photo_transform = photo_transform
         self.sketch_transform = sketch_transform
-        self.prompt_transform = prompt_transform
+        self.caption_transform = caption_transform
 
     def __getitem__(self, index):
         info = self.photo_infos[index]
@@ -86,9 +85,9 @@ class SketchyDataset(data.Dataset):
 
         photo = self.photo_transform(Image.open(photo_path))
         sketch = self.sketch_transform(Image.open(sketch_path))
-        prompt = self.prompt_transform(classname)
+        caption = self.caption_transform(classname)
 
-        return {"photos": photo, "sketches": sketch, "prompts": prompt}
+        return {"photos": photo, "sketches": sketch, "captions": caption}
 
     def __len__(self):
         return len(self.photo_infos)

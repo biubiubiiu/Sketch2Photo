@@ -19,23 +19,20 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="/home/data/sketchy/")
     parser.add_argument("--pretrained_model_name", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument("--controlnet_weight", type=str, default="results")
+    parser.add_argument(
+        "--validation_prompt", type=str, default="a high-quality image that is consistent with the provided sketch"
+    )
     parser.add_argument("--revision", type=str, default=None, required=False)
     parser.add_argument(
         "--output_dir",
         type=str,
         default="results",
-        help="The directory that stores the model predictions and checkpoints.",
+        help="The directory that stores the model checkpoints.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resolution", type=int, default=256, help="The resolution for input images")
     parser.add_argument("--train_batch_size", type=int, default=1, help="Training batch size (per device)")
     parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=None,
-        help="Total number of training steps to perform. If provided, overrides num_train_epochs.",
-    )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -160,9 +157,7 @@ def parse_args():
         default=4,
         help="Number of images to be generated for each sketch",
     )
-    parser.add_argument(
-        "--num_validation_samples", type=int, default=10, help="Number of sketchs for validation"
-    )
+    parser.add_argument("--num_validation_samples", type=int, default=10, help="Number of sketchs for validation")
     parser.add_argument("--validation_steps", type=int, default=1000, help="Run validation every X steps.")
     parser.add_argument(
         "--tracker_project_name",
